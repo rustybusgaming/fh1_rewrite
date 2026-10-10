@@ -187,8 +187,9 @@ jobs:
           code=0; "$APP/Contents/MacOS/extract-xiso" -h > /dev/null 2>&1 || code=$?
           test "$code" -lt 128
           test -x "$APP/Contents/MacOS/fh1-rewrite" && test -x "$APP/Contents/MacOS/fh1setup" && test -x "$APP/Contents/MacOS/fh1-engine"
-          # The self-updater installs this archive over an older app bundle.
-          FH1_UPDATE_TEST_ARCHIVE="$ZIP" cargo test --release --locked -p fh1-launcher -- --ignored installs_local_archive
+          # The self-updater installs this archive over an older app bundle. The path must be absolute:
+          # cargo runs the test from crates/fh1-launcher, not from here.
+          FH1_UPDATE_TEST_ARCHIVE="$PWD/$ZIP" cargo test --release --locked -p fh1-launcher -- --ignored installs_local_archive
 
       - name: Attach to the release
         if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
