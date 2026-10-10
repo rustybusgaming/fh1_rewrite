@@ -361,12 +361,13 @@ mod tests {
 
     /// The same with a release archive built locally (the macOS workflow's smoke test):
     /// `FH1_UPDATE_TEST_ARCHIVE=<archive> cargo test --release -p fh1-launcher -- --ignored installs_local_archive`.
+    /// Give an absolute path: cargo runs tests from the crate directory, not the workspace root.
     #[test]
     #[ignore]
     fn installs_local_archive() {
         let Some(archive) = std::env::var_os("FH1_UPDATE_TEST_ARCHIVE") else { return };
         let archive = std::path::absolute(archive).unwrap();
-        let bytes = std::fs::read(&archive).unwrap();
+        let bytes = std::fs::read(&archive).unwrap_or_else(|e| panic!("{}: {e}", archive.display()));
         let sha256 = Some(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect());
         let path = archive.display().to_string().replace('\\', "/").replace(' ', "%20");
         let url = format!("file://{}{path}", if path.starts_with('/') { "" } else { "/" });
