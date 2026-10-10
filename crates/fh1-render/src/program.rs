@@ -631,6 +631,8 @@ var<private> fx_dbg2: vec4<f32>;
     }
 
     let uses_object = vr.uses_object || ps_object;
+    // Metal: the slot samplers are one array (crate::sampler_array).
+    let m = crate::sampler_array::wgsl(&m);
     Some(Program { wgsl: m, attributes, textures, state, material_defaults, globals, named, samplers, vs, ps, uses_object })
 }
 

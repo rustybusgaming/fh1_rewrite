@@ -3,8 +3,8 @@
 //! with the launcher; before install, a painted dusk gradient stands in).
 //!
 //! Fonts come from the system like the engine's UiFont (ui.rs): Segoe UI Black Italic for titles and menu items and
-//! Bahnschrift for body text on Windows, DejaVu / Liberation / Noto on Linux. None is redistributed; egui's default
-//! font is the last fallback.
+//! Bahnschrift for body text on Windows, Arial Bold Italic / Arial on macOS, DejaVu / Liberation / Noto on Linux. None
+//! is redistributed; egui's default font is the last fallback.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ pub fn body(size: f32) -> FontId {
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let windir = std::env::var_os("WINDIR").map_or_else(|| std::path::PathBuf::from(r"C:\Windows"), std::path::PathBuf::from);
-    // The first font file that exists: Windows' Fonts folder, else common Linux locations.
+    // The first font file that exists: Windows' Fonts folder, else macOS and common Linux locations.
     let font = |names: &[&str]| {
         names.iter().find_map(|n| {
             let p = std::path::Path::new(n);
@@ -42,6 +42,8 @@ pub fn install(ctx: &egui::Context) {
     let heavy_files = [
         "seguibli.ttf",
         "seguibl.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+        "/System/Library/Fonts/Supplemental/Trebuchet MS Bold Italic.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
         "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
@@ -51,6 +53,8 @@ pub fn install(ctx: &egui::Context) {
     ];
     let body_files = [
         "bahnschrift.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",

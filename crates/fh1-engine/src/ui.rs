@@ -310,11 +310,13 @@ pub struct UiFont(pub Handle<Font>);
 
 impl FromWorld for UiFont {
     fn from_world(world: &mut World) -> Self {
-        // Bahnschrift (DIN-style, ships with Windows 10+) reads like a racing HUD; on Linux a condensed system sans
-        // stands in. Loaded from the user's system and never redistributed.
+        // Bahnschrift (DIN-style, ships with Windows 10+) reads like a racing HUD; macOS has DIN itself, on Linux a
+        // condensed system sans stands in. Loaded from the user's system and never redistributed.
         let windir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         let candidates = [
             windir.join("Fonts").join("bahnschrift.ttf"),
+            PathBuf::from("/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf"),
+            PathBuf::from("/System/Library/Fonts/Supplemental/Arial.ttf"),
             PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf"),
             PathBuf::from("/usr/share/fonts/TTF/DejaVuSansCondensed.ttf"),
             PathBuf::from("/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Regular.ttf"),

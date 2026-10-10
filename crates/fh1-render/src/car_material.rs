@@ -47,9 +47,9 @@ impl From<&FxCarMaterial> for FxCarKey {
     }
 }
 
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-#[bind_group_data(FxCarKey)]
-pub struct FxCarMaterial {
+/// What an [`FxCarMaterial`] binds (its derived bind group; same layout rules as [`crate::FxBindings`]).
+#[derive(AsBindGroup, Debug, Clone)]
+pub struct FxCarBindings {
     #[uniform(0)]
     pub consts: FxCarConsts,
     /// The car globals bank (`FxCarGlobals`).
@@ -100,6 +100,12 @@ pub struct FxCarMaterial {
     /// Car headlight records + dip beam (crate::headlight, shared).
     #[storage(40, read_only)]
     pub headlights: Handle<bevy::render::storage::ShaderBuffer>,
+}
+
+#[derive(Asset, TypePath, Debug, Clone, Deref, DerefMut)]
+pub struct FxCarMaterial {
+    #[deref]
+    pub bindings: FxCarBindings,
     pub program: u32,
     pub flip_cull: bool,
     pub no_cull: bool,
@@ -116,7 +122,9 @@ pub struct FxCarMaterial {
     pub order: u32,
 }
 
-impl FxCarMaterial {
+crate::sampler_array::fx_as_bind_group!(FxCarMaterial, FxCarBindings, FxCarKey);
+
+impl FxCarBindings {
     /// Texture slot by sampler register (tf#), or 100 + k for cube slot k.
     pub fn slot_mut(&mut self, tf: u32) -> Option<&mut Option<Handle<Image>>> {
         Some(match tf {
