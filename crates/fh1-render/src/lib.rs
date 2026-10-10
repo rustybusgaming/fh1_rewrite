@@ -18,6 +18,7 @@ pub mod program;
 pub mod quality;
 pub mod mirror;
 pub mod reflect;
+pub mod sampler_array;
 pub mod scenery;
 pub mod shadow;
 pub mod sky;
@@ -38,7 +39,7 @@ use bevy::render::storage::ShaderBuffer;
 use fh1_shaders::container::{RegisterSet, Stage};
 use fh1_shaders::effect::Effect;
 
-pub use material::{FxMaterial, FxMaterialConsts};
+pub use material::{FxBindings, FxMaterial, FxMaterialConsts};
 pub use program::Program;
 
 pub struct Fh1RenderPlugin;
@@ -74,6 +75,11 @@ impl Plugin for Fh1RenderPlugin {
         let mut car_globals = new_globals(&mut app.world_mut().resource_mut::<Assets<ShaderBuffer>>());
         car_globals.all_defaults = true;
         app.insert_resource(globals).insert_resource(FxCarGlobals(car_globals)).init_resource::<FxLibrary>();
+        if sampler_array::ENABLED {
+            if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+                render_app.add_systems(bevy::render::RenderStartup, |device: Res<bevy::render::renderer::RenderDevice>| sampler_array::check(&device));
+            }
+        }
     }
 }
 
@@ -405,28 +411,30 @@ impl FxLibrary {
             }
         }
         FxMaterial {
-            consts,
-            globals: globals.buffer(),
-            t0: None,
-            t1: None,
-            t2: None,
-            t3: None,
-            t4: None,
-            t5: None,
-            t6: None,
-            t7: None,
-            t8: None,
-            t9: None,
-            t10: None,
-            t11: None,
-            t12: None,
-            t13: None,
-            t14: None,
-            t15: None,
-            cube0: None,
-            cube1: None,
-            cube2: None,
-            headlights: headlight::HEADLIGHT_BUFFER,
+            bindings: material::FxBindings {
+                consts,
+                globals: globals.buffer(),
+                t0: None,
+                t1: None,
+                t2: None,
+                t3: None,
+                t4: None,
+                t5: None,
+                t6: None,
+                t7: None,
+                t8: None,
+                t9: None,
+                t10: None,
+                t11: None,
+                t12: None,
+                t13: None,
+                t14: None,
+                t15: None,
+                cube0: None,
+                cube1: None,
+                cube2: None,
+                headlights: headlight::HEADLIGHT_BUFFER,
+            },
             program: id,
             flip_cull: false,
             no_cull: true,

@@ -1,0 +1,205 @@
+# macOS (Apple Silicon) build of the release (experimental): FH1Rewrite-<ver>-macos-arm64.zip, attached to the GitHub
+# release.
+#
+# Triggers: a published release (attaches the archive to it), a manual run (optionally attaching to an existing tag),
+# and pushes to the `macos-ci` branch (build + test only, archive kept as a workflow artifact).
+#
+# Layout (crates/fh1-launcher/src/main.rs): FH1 Rewrite.app/Contents/MacOS/ holds the launcher (fh1-rewrite) and
+# fh1-engine, fh1setup, extract-xiso, ffmpeg side by side; licences in Contents/Resources/licenses. Converted data goes
+# to ~/Library/Application Support/FH1 Rewrite. The app is ad-hoc signed, not notarized: users open it once through
+# System Settings > Privacy & Security (README.txt). Needs macOS 14+ (the pinned extract-xiso build's minimum).
+#
+# ffmpeg is built here from the pinned source release: LGPL, FFmpeg's own decoders only (xma2 for the engine sounds,
+# wmv3 / wmapro / wmav2 for the movies), no external libraries, so the binary runs on any Apple Silicon Mac.
+#
+# Secret FH1_XEX_KEY (32 hex digits) is embedded into fh1setup at compile time, like tools/release.ps1 does on Windows.
+name: macOS release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the archive to (empty = build only)"
+        required: false
+  push:
+    branches: [macos-ci]
+
+permissions:
+  contents: write
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+  FFMPEG_VERSION: "7.1.1"
+  FFMPEG_SHA256: "733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1"
+
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build
+        env:
+          FH1_XEX_KEY_EMBED: ${{ secrets.FH1_XEX_KEY }}
+        # No RTX on macOS (DLSS is Windows-only here): --no-default-features drops fh1-engine's `rtx`.
+        run: cargo build --release --locked --no-default-features -p fh1setup --features fh2,fm4 -p fh1-launcher -p fh1-engine
+
+      - name: "Tests (formats paths, launcher, FX sampler array)"
+        run: |
+          cargo test --release --locked -p fh1-formats path::
+          cargo test --release --locked -p fh1-launcher
+          cargo test --release --locked -p fh1-render sampler_array
+
+      - name: ffmpeg cache
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-build/out
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-macos-arm64-${{ env.MACOSX_DEPLOYMENT_TARGET }}-v1
+
+      - name: Build ffmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ffmpeg-build && cd ffmpeg-build
+          curl -sSfL -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          echo "$FFMPEG_SHA256  ffmpeg.tar.xz" | shasum -a 256 -c -
+          tar -xJf ffmpeg.tar.xz
+          cd "ffmpeg-$FFMPEG_VERSION"
+          ./configure --prefix="$PWD/../out" --disable-autodetect --disable-network --disable-doc --disable-debug \
+            --disable-ffplay --disable-ffprobe --enable-static --disable-shared
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          cp COPYING.LGPLv2.1 ../out/
+
+      - name: Check ffmpeg
+        run: |
+          set -euo pipefail
+          FF=ffmpeg-build/out/bin/ffmpeg
+          otool -L "$FF"
+          for d in xma2 wmv3 wmapro wmav2; do
+            "$FF" -hide_banner -decoders | awk '{print $2}' | grep -qx "$d" || { echo "ffmpeg lacks the $d decoder"; exit 1; }
+          done
+
+      - name: Package
+        id: pack
+        run: |
+          set -euo pipefail
+          VER=$(grep -m1 '^version' crates/fh1-launcher/Cargo.toml | cut -d'"' -f2)
+          OUT=dist/FH1Rewrite-$VER
+          APP="$OUT/FH1 Rewrite.app"
+          rm -rf dist
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/licenses"
+          LIC="$APP/Contents/Resources/licenses"
+          cp target/release/fh1-launcher "$APP/Contents/MacOS/fh1-rewrite"
+          cp target/release/fh1-engine target/release/fh1setup ffmpeg-build/out/bin/ffmpeg "$APP/Contents/MacOS/"
+
+          # extract-xiso (pinned XboxDev build, same release as the Windows and Linux ones; arm64, macOS 14+).
+          curl -sSfL -o "$RUNNER_TEMP/xiso.zip" https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso_macOS.zip
+          echo "371e4a800086e875257ddafc037970789fb942b69dbf8ab0ba8301ff7799fef0  $RUNNER_TEMP/xiso.zip" | shasum -a 256 -c -
+          unzip -o -q "$RUNNER_TEMP/xiso.zip" -d "$RUNNER_TEMP/xiso"
+          cp "$RUNNER_TEMP/xiso/extract-xiso" "$APP/Contents/MacOS/"
+          cp "$RUNNER_TEMP/xiso/LICENSE.TXT" "$LIC/extract-xiso-LICENSE.txt"
+
+          cp ffmpeg-build/out/COPYING.LGPLv2.1 "$LIC/ffmpeg-LICENSE.txt"
+          echo "ffmpeg $FFMPEG_VERSION, built unmodified from https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz (LGPL 2.1 or later; no external libraries; configure options in .github/workflows/macos-release.yml of https://github.com/Sm1jjj/fh1_rewrite)" > "$LIC/ffmpeg.txt"
+          cp LICENSE "$LIC/FH1-Rewrite-GPL-3.0.txt"
+
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key><string>FH1 Rewrite</string>
+              <key>CFBundleDisplayName</key><string>FH1 Rewrite</string>
+              <key>CFBundleIdentifier</key><string>io.github.sm1jjj.fh1rewrite</string>
+              <key>CFBundleExecutable</key><string>fh1-rewrite</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleShortVersionString</key><string>$VER</string>
+              <key>CFBundleVersion</key><string>$VER</string>
+              <key>LSMinimumSystemVersion</key><string>$MACOSX_DEPLOYMENT_TARGET</string>
+              <key>LSApplicationCategoryType</key><string>public.app-category.racing-games</string>
+              <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$APP/Contents/Info.plist"
+          printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+          cat > "$OUT/README.txt" <<EOF
+          FH1 Rewrite $VER (macOS, Apple Silicon, EXPERIMENTAL)
+          ===================================================
+
+          An unofficial, clean reimplementation of Forza Horizon (Xbox 360, 2012). Not affiliated with Microsoft, Turn 10 or
+          Playground Games. No game files are included: you need your own Forza Horizon disc image.
+
+          The macOS build is experimental: please report problems at https://github.com/Sm1jjj/fh1_rewrite/issues
+
+          Needs an Apple Silicon Mac (M1 or newer) on macOS 14 or newer, and about 30 GB free.
+
+          1. Drag "FH1 Rewrite" into your Applications folder.
+          2. Open it. The app is not notarized by Apple, so macOS blocks the first launch: click Done, open
+             System Settings > Privacy & Security, scroll down and click "Open Anyway" next to FH1 Rewrite. Only once.
+          3. Choose your Forza Horizon disc: the .iso, a .zip holding it, or the folder it is in. Click Install, then PLAY.
+
+          Your converted games, settings and logs are kept in ~/Library/Application Support/FH1 Rewrite
+          (the launcher's "Data folder" button opens it). Source code: https://github.com/Sm1jjj/fh1_rewrite
+          EOF
+
+          # Ad-hoc signatures: the tools first, then the bundle (seals Info.plist, the resources and the tools).
+          for b in fh1-engine fh1setup ffmpeg extract-xiso; do
+            codesign --force --sign - --timestamp=none "$APP/Contents/MacOS/$b"
+          done
+          codesign --force --sign - --timestamp=none "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          file "$APP"/Contents/MacOS/*
+
+          # Ship no game assets: nothing converted from a disc may end up in the archive.
+          if find "$OUT" -type f \( -iname '*.wmv' -o -iname '*.mp4' -o -iname '*.wav' -o -iname '*.fsb' -o -iname '*.fev' \
+              -o -iname '*.carbin' -o -iname '*.dds' -o -iname '*.xds' \) | grep .; then
+            echo "game assets in $OUT"; exit 1
+          fi
+
+          ZIP="dist/FH1Rewrite-$VER-macos-arm64.zip"
+          ditto -c -k --keepParent --norsrc --noextattr --noqtn "$OUT" "$ZIP"
+          echo "archive=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (launcher layout)
+        run: |
+          set -euo pipefail
+          ZIP="${{ steps.pack.outputs.archive }}"
+          rm -rf "$RUNNER_TEMP/unzip" && mkdir -p "$RUNNER_TEMP/unzip"
+          ditto -x -k "$ZIP" "$RUNNER_TEMP/unzip"
+          APP=$(find "$RUNNER_TEMP/unzip" -maxdepth 2 -name 'FH1 Rewrite.app' | head -1)
+          codesign --verify --deep --strict "$APP"
+          "$APP/Contents/MacOS/ffmpeg" -hide_banner -version | head -1
+          # Runs at all (a bad signature is a SIGKILL, exit code 137); its usage text may exit non-zero.
+          code=0; "$APP/Contents/MacOS/extract-xiso" -h > /dev/null 2>&1 || code=$?
+          test "$code" -lt 128
+          test -x "$APP/Contents/MacOS/fh1-rewrite" && test -x "$APP/Contents/MacOS/fh1setup" && test -x "$APP/Contents/MacOS/fh1-engine"
+          # The self-updater installs this archive over an older app bundle.
+          FH1_UPDATE_TEST_ARCHIVE="$ZIP" cargo test --release --locked -p fh1-launcher -- --ignored installs_local_archive
+
+      - name: Attach to the release
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" "${{ steps.pack.outputs.archive }}" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Keep as a workflow artifact
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag == '')
+        uses: actions/upload-artifact@v4
+        with:
+          name: fh1rewrite-macos-arm64
+          path: ${{ steps.pack.outputs.archive }}

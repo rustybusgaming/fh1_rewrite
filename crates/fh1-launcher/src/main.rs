@@ -11,6 +11,10 @@
 //! <root>/bin/ffmpeg.exe         XMA audio decoding during setup, FMV playback in the game (FH1_FFMPEG)
 //! <root>/data/                  converted assets (installation.json, installations/<id>/...), launcher.json, logs/
 //! ```
+//! Linux: the same without `.exe` (the launcher is `fh1-rewrite`). macOS (.github/workflows/macos-release.yml): an app
+//! bundle, `FH1 Rewrite.app/Contents/MacOS/` holding the launcher (`fh1-rewrite`) and the four tools side by side; the
+//! data folder is `~/Library/Application Support/FH1 Rewrite`, since the bundle may be read-only (see [`macos`]).
+//!
 //! Only FH1 is required. Games that are not imported stay locked (greyed) in the game's menus.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -42,7 +46,13 @@ pub(crate) fn hide_console(cmd: &mut Command) -> &mut Command {
 
 /// Open a folder or web page with the desktop's default handler.
 pub(crate) fn open_external(target: impl AsRef<std::ffi::OsStr>) {
-    let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     let _ = Command::new(opener).arg(target).spawn();
 }
 /// The converted-data revision: bump ONLY when a release's setup output changes (a new fh1setup group version), so
@@ -64,7 +74,8 @@ fn main() -> eframe::Result {
 }
 
 /// Where everything lives. `<root>` = the launcher's folder; tools in `<root>/bin`, or next to the launcher in a
-/// dev build (target/release). `FH1_DATA` overrides the data folder.
+/// dev build (target/release) and in the macOS app bundle. Data in `<root>/data`, on macOS in Application Support.
+/// `FH1_DATA` overrides the data folder.
 struct Paths {
     root: PathBuf,
     bin: PathBuf,
@@ -75,8 +86,14 @@ impl Paths {
     fn find() -> Self {
         let root = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| ".".into());
         let bin = if root.join(format!("bin/fh1setup{EXE}")).is_file() { root.join("bin") } else { root.clone() };
-        let data = std::env::var_os("FH1_DATA").map(PathBuf::from).unwrap_or_else(|| root.join("data"));
+        let data = std::env::var_os("FH1_DATA").map(PathBuf::from).or_else(macos::data_dir).unwrap_or_else(|| root.join("data"));
         Paths { root, bin, data }
+    }
+
+    /// The tools' working directory (the game writes `screenshots/` there): the launcher's folder, or the data folder
+    /// on macOS (never inside the app bundle).
+    fn work(&self) -> &Path {
+        if cfg!(target_os = "macos") { &self.data } else { &self.root }
     }
 
     /// `<data>/installations/<id>/assets/private` of the active install, if FH1 is installed.
@@ -185,9 +202,14 @@ impl Launcher {
         style::install(ctx);
         let paths = Paths::find();
         let backdrop = paths.private().and_then(|p| style::load_backdrop(ctx, &p));
+        let install = update::install_root(&paths.root);
+        let translocated = macos::translocated(&install);
+        if !translocated {
+            macos::clear_quarantine(&install);
+        }
         // Only a release layout updates itself (not a dev build in target\release).
-        let update_rx = (update::enabled() && paths.root.join(update::LAUNCHER).is_file()).then(|| {
-            update::cleanup(&paths.root);
+        let update_rx = (update::enabled() && !translocated && install.join(update::LAUNCHER).is_file()).then(|| {
+            update::cleanup(&install);
             let (tx, rx) = channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
@@ -215,7 +237,7 @@ impl Launcher {
             cancelled: Arc::new(Mutex::new(false)),
             game_running: false,
             game_rx: None,
-            status: None,
+            status: translocated.then(|| macos::TRANSLOCATED.to_owned()),
             backdrop,
             backdrop_pending: false,
             update: None,
@@ -270,7 +292,7 @@ impl Launcher {
         self.rx = Some(rx);
         let setup = self.paths.bin.join(format!("fh1setup{EXE}"));
         let ffmpeg = self.paths.bin.join(format!("ffmpeg{EXE}"));
-        let (root, data, delete_work) = (self.paths.root.clone(), self.paths.data.clone(), self.delete_work);
+        let (work, data, delete_work) = (self.paths.work().to_path_buf(), self.paths.data.clone(), self.delete_work);
         let (child, cancelled, ctx) = (self.child.clone(), self.cancelled.clone(), ctx.clone());
         std::thread::spawn(move || {
             let send = |m: Msg| {
@@ -281,7 +303,7 @@ impl Launcher {
             for (i, step) in steps.iter().enumerate() {
                 send(Msg::Step(i));
                 let mut cmd = Command::new(&setup);
-                hide_console(cmd.args(&step.args).current_dir(&root).stdout(Stdio::piped()).stderr(Stdio::piped()));
+                hide_console(cmd.args(&step.args).current_dir(&work).stdout(Stdio::piped()).stderr(Stdio::piped()));
                 if ffmpeg.is_file() && std::env::var_os("FH1_FFMPEG").is_none() {
                     cmd.env("FH1_FFMPEG", &ffmpeg);
                 }
@@ -317,7 +339,7 @@ impl Launcher {
             return;
         };
         let mut cmd = Command::new(self.paths.bin.join(format!("fh1-engine{EXE}")));
-        hide_console(cmd.arg("--data").arg(&self.paths.data).current_dir(&self.paths.root));
+        hide_console(cmd.arg("--data").arg(&self.paths.data).current_dir(self.paths.work()));
         if std::env::var_os("FH1_WINDOW").is_none() {
             cmd.env("FH1_WINDOW", "borderless");
         }
@@ -367,7 +389,7 @@ impl Launcher {
                     self.update_error = Some(e);
                 }
                 update::UpdateMsg::Installed => {
-                    update::restart(&self.paths.root);
+                    update::restart(&update::install_root(&self.paths.root));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -380,7 +402,7 @@ impl Launcher {
         self.update_error = None;
         let (tx, rx) = channel();
         self.update_rx = Some(rx);
-        let (root, data, ctx) = (self.paths.root.clone(), self.paths.data.clone(), ctx.clone());
+        let (root, data, ctx) = (update::install_root(&self.paths.root), self.paths.data.clone(), ctx.clone());
         std::thread::spawn(move || {
             let repaint = || ctx.request_repaint();
             update::install(&rel, &root, &data, &tx, &repaint);
@@ -506,7 +528,8 @@ impl Launcher {
         if self.saved.own_fm4 {
             gb += 42 + 15;
         }
-        ui.label(RichText::new(format!("Needs about {gb} GB free next to this program while installing; up to an hour on slower PCs.")).color(style::DIM));
+        let place = if cfg!(target_os = "macos") { "on this Mac" } else { "next to this program" };
+        ui.label(RichText::new(format!("Needs about {gb} GB free {place} while installing; up to an hour on slower PCs.")).color(style::DIM));
         ui.add_space(12.0);
 
         let missing = self.missing();
@@ -541,7 +564,11 @@ impl Launcher {
             return Some("The FM4 Content Install Disc path doesn't exist.");
         }
         if !self.paths.bin.join(format!("fh1setup{EXE}")).is_file() {
-            return Some("fh1setup is missing from the bin folder next to this program. Re-extract the release.");
+            return Some(if cfg!(target_os = "macos") {
+                "fh1setup is missing from the app. Download the release again."
+            } else {
+                "fh1setup is missing from the bin folder next to this program. Re-extract the release."
+            });
         }
         None
     }
@@ -790,4 +817,43 @@ fn parse_progress(line: &str) -> Option<Msg> {
     let (a, b): (f32, f32) = (a.parse().ok()?, b.parse().ok()?);
     let text = if group == "done" { "done".to_owned() } else { format!("converting {group} ({}/{})", a as u32 + 1, b as u32) };
     Some(Msg::Progress(if b > 0.0 { a / b } else { 0.0 }, text))
+}
+
+/// macOS specifics. The release is an unsigned (ad-hoc signed) app bundle:
+/// - Data lives in `~/Library/Application Support/FH1 Rewrite`: the bundle is not a place to write 30 GB, and when macOS
+///   runs a quarantined app straight from the folder it was unzipped into (App Translocation) the bundle is a read-only
+///   copy at a random path.
+/// - Once the user has opened the app (Gatekeeper's "Open Anyway"), the launcher clears the quarantine flag on its own
+///   bundle, so the tools it starts (fh1setup, fh1-engine, ffmpeg, extract-xiso) are not each blocked again.
+mod macos {
+    use std::path::{Path, PathBuf};
+
+    pub const TRANSLOCATED: &str =
+        "macOS is running FH1 Rewrite from a temporary copy. Drag it into your Applications folder and open it from there to get updates.";
+
+    /// `~/Library/Application Support/FH1 Rewrite` (macOS only).
+    pub fn data_dir() -> Option<PathBuf> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+        Some(PathBuf::from(home).join("Library/Application Support/FH1 Rewrite"))
+    }
+
+    /// The app runs from App Translocation's read-only copy (quarantined and never moved since it was unzipped).
+    pub fn translocated(bundle: &Path) -> bool {
+        cfg!(target_os = "macos") && bundle.components().any(|c| c.as_os_str() == "AppTranslocation")
+    }
+
+    /// Clears `com.apple.quarantine` from the app bundle (best effort, in the background).
+    pub fn clear_quarantine(bundle: &Path) {
+        if cfg!(target_os = "macos") && bundle.extension().is_some_and(|e| e == "app") {
+            let _ = std::process::Command::new("/usr/bin/xattr")
+                .args(["-dr", "com.apple.quarantine"])
+                .arg(bundle)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
 }

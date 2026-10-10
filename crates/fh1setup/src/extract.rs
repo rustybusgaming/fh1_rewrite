@@ -13,9 +13,14 @@ use sha2::{Digest, Sha256};
 const XISO_URL: &str = "https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso-Win64_Release.zip";
 #[cfg(windows)]
 const XISO_SHA256: &str = "fec88d03c7efd6205ab09be4abba70c0afd0eb27a5709f0a6235b828ba5ac11e";
-#[cfg(not(windows))]
+// macOS: arm64, needs macOS 14+.
+#[cfg(target_os = "macos")]
+const XISO_URL: &str = "https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso_macOS.zip";
+#[cfg(target_os = "macos")]
+const XISO_SHA256: &str = "371e4a800086e875257ddafc037970789fb942b69dbf8ab0ba8301ff7799fef0";
+#[cfg(not(any(windows, target_os = "macos")))]
 const XISO_URL: &str = "https://github.com/XboxDev/extract-xiso/releases/download/build-202505152050/extract-xiso_Linux.zip";
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 const XISO_SHA256: &str = "982bbfefc9255d51f5348a477d7135d68abf81c0af9600e5728edb1246cfa200";
 /// `extract-xiso.exe` on Windows, `extract-xiso` elsewhere.
 fn xiso_name() -> String {

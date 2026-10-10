@@ -184,7 +184,10 @@ impl Plugin for FxShadowPlugin {
             let mut images = app.world_mut().resource_mut::<Assets<Image>>();
             images.add(mask_image(UVec2::ONE))
         };
-        PREPASS_SHADER.get_or_init(|| app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(PREPASS_WGSL, "fh1/shadow_prepass.wgsl")));
+        PREPASS_SHADER.get_or_init(|| {
+            let src = crate::sampler_array::wgsl(PREPASS_WGSL);
+            app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(src, "fh1/shadow_prepass.wgsl"))
+        });
         CASTER_SHADER.get_or_init(|| app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(CASTER_WGSL, "fh1/shadow_caster.wgsl")));
         let mask_shader = app.world_mut().resource_mut::<Assets<Shader>>().add(Shader::from_wgsl(MASK_WGSL, "fh1/shadow_mask.wgsl"));
         app.add_plugins(bevy::pbr::MaterialPlugin::<FxCasterMaterial>::default())
@@ -1110,7 +1113,7 @@ struct FxShadowMaterial { vs: array<vec4<f32>, 16>, ps: array<vec4<f32>, 16>, ga
 #ifdef FX_ALPHA_KILL
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> fx_mat: FxShadowMaterial;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var fx_t0: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var fx_s0: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var fx_t0_s: sampler;
 #endif
 
 @fragment
@@ -1118,13 +1121,13 @@ fn fragment(in: VertexOutput) {
 #ifdef FX_ALPHA_KILL
 #ifdef VERTEX_UVS_A
 #ifdef FX_TREE
-    if textureSample(fx_t0, fx_s0, in.uv).a < 0.1 {
+    if textureSample(fx_t0, fx_t0_s, in.uv).a < 0.1 {
         discard;
     }
 #else
     let c0 = fx_mat.ps[0].xy;
     let scale = select(vec2<f32>(1.0), c0, c0.x != 0.0 && c0.y != 0.0);
-    if textureSample(fx_t0, fx_s0, in.uv * scale).a < 0.5 {
+    if textureSample(fx_t0, fx_t0_s, in.uv * scale).a < 0.5 {
         discard;
     }
 #endif

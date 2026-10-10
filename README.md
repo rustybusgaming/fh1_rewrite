@@ -6,6 +6,7 @@
   <a href="https://github.com/Sm1jjj/fh1_rewrite/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/Sm1jjj/fh1_rewrite?label=download&style=for-the-badge&color=ff7a3c"></a>
   <img alt="Windows x64" src="https://img.shields.io/badge/windows-x64-1b1446?style=for-the-badge">
   <img alt="Linux x64 (experimental)" src="https://img.shields.io/badge/linux-x64%20(experimental)-1b1446?style=for-the-badge">
+  <img alt="macOS Apple Silicon (experimental)" src="https://img.shields.io/badge/macos-apple%20silicon%20(experimental)-1b1446?style=for-the-badge">
   <img alt="Rust + Bevy" src="https://img.shields.io/badge/rust-bevy%200.19-1b1446?style=for-the-badge">
   <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-1b1446?style=for-the-badge">
 </p>
@@ -34,6 +35,11 @@ when a new release is out.
 
 **Linux (experimental):** download `FH1Rewrite-<version>-linux-x64.tar.gz` from the same release, extract it and run
 `./fh1-rewrite`. It's built automatically for every release and gets less testing than Windows.
+
+**macOS (experimental):** needs an Apple Silicon Mac (M1 or newer) on macOS 14 or newer. Download
+`FH1Rewrite-<version>-macos-arm64.zip`, drag **FH1 Rewrite** into Applications and open it. The app isn't notarized, so
+the first launch is blocked: open System Settings → Privacy & Security and click **Open Anyway** (once). Converted games
+and logs live in `~/Library/Application Support/FH1 Rewrite`.
 
 ### Graphics settings
 
@@ -106,7 +112,8 @@ layouts.
 
 ## Build from source
 
-Requires Windows, Rust (stable, MSVC toolchain) and your own Forza Horizon disc.
+Requires Windows, Rust (stable, MSVC toolchain) and your own Forza Horizon disc. Linux and macOS (Apple Silicon) build
+too; the RTX mode is Windows-only, so build the engine there with `--no-default-features`.
 
 ```
 cargo run --release -p fh1setup -- "path/to/Forza Horizon.iso"     # or an extracted disc folder
@@ -121,7 +128,8 @@ cargo run --release -p fh1setup --features fh2 -- import-fh2 "path/to/FH2.iso"
 cargo run --release -p fh1setup --features fm4 -- import-fm4 "path/to/FM4 Play Disc.iso" --content "path/to/FM4 Content Install Disc.iso"
 ```
 
-`tools\release.ps1` builds the Windows release zip. Vendored crates keep their own licenses: `vendor/lzxd` (patched for
+`tools\release.ps1` builds the Windows release zip; `.github/workflows/linux-release.yml` and `macos-release.yml` build the
+Linux and macOS ones. Vendored crates keep their own licenses: `vendor/lzxd` (patched for
 XMemCompress streams), `vendor/bevy_pbr` (shadow cascade caching, cached bind groups, static atmosphere LUTs),
 `vendor/wgpu-core` (bind group tracking once per pass / command buffer) and `vendor/bevy_solarik`; each patched crate
 lists its changes in `FH1_PATCHES.md`.

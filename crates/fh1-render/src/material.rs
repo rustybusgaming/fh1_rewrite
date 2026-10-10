@@ -123,9 +123,10 @@ impl From<&FxMaterial> for FxKey {
     }
 }
 
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-#[bind_group_data(FxKey)]
-pub struct FxMaterial {
+/// What an [`FxMaterial`] binds (its derived bind group). Kept apart from the pipeline-key fields so the material's
+/// own `AsBindGroup` can rebind the samplers on Metal (crate::sampler_array); `FxMaterial` derefs to it.
+#[derive(AsBindGroup, Debug, Clone)]
+pub struct FxBindings {
     #[uniform(0)]
     pub consts: FxMaterialConsts,
     #[storage(1, read_only)]
@@ -197,13 +198,21 @@ pub struct FxMaterial {
     /// Car headlight records + dip beam (crate::headlight, shared by every material).
     #[storage(40, read_only)]
     pub headlights: Handle<ShaderBuffer>,
+}
+
+#[derive(Asset, TypePath, Debug, Clone, Deref, DerefMut)]
+pub struct FxMaterial {
+    #[deref]
+    pub bindings: FxBindings,
     pub program: u32,
     pub flip_cull: bool,
     pub no_cull: bool,
     pub alpha_blend: bool,
 }
 
-impl FxMaterial {
+crate::sampler_array::fx_as_bind_group!(FxMaterial, FxBindings, FxKey);
+
+impl FxBindings {
     /// Texture slot by sampler register (tf#), or 100 + k for cube slot k; `None` if unbound.
     pub fn slot_mut(&mut self, tf: u32) -> Option<&mut Option<Handle<Image>>> {
         Some(match tf {

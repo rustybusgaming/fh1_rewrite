@@ -6,6 +6,10 @@
 //! the SHA-256 digest GitHub publishes for the asset. The running launcher renames itself to `*.old` (Windows allows
 //! renaming a running exe), writes the new one and restarts; leftovers are removed on the next start.
 //!
+//! Linux takes `-linux-x64.tar.gz` (unpacked with `tar`, keeping the executable bits). macOS takes `-macos-arm64.zip`,
+//! whose `FH1 Rewrite.app` replaces the running app bundle's files in place ([`install_root`]); the new launcher is
+//! started through LaunchServices (`open -n`).
+//!
 //! `FH1_UPDATE=off` disables the check; `FH1_UPDATE_REPO=owner/name` points at another repository (testing).
 
 use std::io::Read;
@@ -16,9 +20,16 @@ use std::sync::mpsc::Sender;
 use sha2::{Digest, Sha256};
 
 const REPO: &str = "Sm1jjj/fh1_rewrite";
-/// The release asset for this platform (tools/release.ps1 / the Linux workflow).
-const ASSET_SUFFIX: &str = if cfg!(windows) { "-win64.zip" } else { "-linux-x64.tar.gz" };
-const EXE: &str = std::env::consts::EXE_SUFFIX;
+/// The release asset for this platform (tools/release.ps1 / the Linux and macOS workflows).
+const ASSET_SUFFIX: &str = if cfg!(windows) {
+    "-win64.zip"
+} else if cfg!(target_os = "macos") {
+    "-macos-arm64.zip"
+} else {
+    "-linux-x64.tar.gz"
+};
+/// The app bundle's name in the macOS release archive.
+const APP: &str = "FH1 Rewrite.app";
 
 #[derive(Clone, Debug)]
 pub struct Release {
@@ -155,15 +166,15 @@ fn install_inner(rel: &Release, root: &Path, data: &Path, progress: &dyn Fn(f32)
     unpack(&zip_path, &stage)?;
     let mut files = Vec::new();
     walk(&stage, &stage, &mut files);
-    files.retain(|f| !f.starts_with("data/"));
-    if !files.iter().any(|f| f == LAUNCHER) || !files.iter().any(|f| *f == format!("bin/fh1-engine{EXE}")) {
+    let files: Vec<(String, String)> = files.into_iter().filter_map(|f| installed_path(&f).map(|to| (f, to))).collect();
+    if !files.iter().any(|(_, f)| f == LAUNCHER) || !files.iter().any(|(_, f)| f == ENGINE) {
         return Err("the update zip doesn't look like an FH1 Rewrite release".into());
     }
     progress(0.96);
 
     // Swap: running exes are renamed aside (allowed on Windows), then the new files move in.
-    for f in &files {
-        let (src, dst) = (stage.join(f), root.join(f));
+    for (f, to) in &files {
+        let (src, dst) = (stage.join(f), root.join(to));
         if let Some(p) = dst.parent() {
             std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
@@ -186,11 +197,45 @@ fn install_inner(rel: &Release, root: &Path, data: &Path, progress: &dyn Fn(f32)
     Ok(())
 }
 
-/// The launcher's name in the release archive (and next to `bin`).
-pub const LAUNCHER: &str = if cfg!(windows) { "FH1 Rewrite.exe" } else { "fh1-rewrite" };
+/// The launcher, relative to [`install_root`].
+pub const LAUNCHER: &str = if cfg!(windows) {
+    "FH1 Rewrite.exe"
+} else if cfg!(target_os = "macos") {
+    "Contents/MacOS/fh1-rewrite"
+} else {
+    "fh1-rewrite"
+};
+/// The game, relative to [`install_root`].
+const ENGINE: &str = if cfg!(windows) {
+    "bin/fh1-engine.exe"
+} else if cfg!(target_os = "macos") {
+    "Contents/MacOS/fh1-engine"
+} else {
+    "bin/fh1-engine"
+};
+
+/// What an update replaces, given the launcher's folder: that folder, or on macOS the app bundle around it
+/// (`<X>.app/Contents/MacOS`).
+pub fn install_root(launcher_dir: &Path) -> PathBuf {
+    let bundle = launcher_dir.parent().filter(|c| c.ends_with("Contents")).and_then(Path::parent);
+    match bundle {
+        Some(b) if cfg!(target_os = "macos") && launcher_dir.ends_with("MacOS") && b.extension().is_some_and(|e| e == "app") => b.to_path_buf(),
+        _ => launcher_dir.to_path_buf(),
+    }
+}
+
+/// Where a file of the unpacked release goes, relative to [`install_root`]; None = not installed (the data folder,
+/// and on macOS everything outside the app bundle, e.g. README.txt).
+fn installed_path(staged: &str) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        staged.strip_prefix(APP)?.strip_prefix('/').map(str::to_owned)
+    } else {
+        (!staged.starts_with("data/")).then(|| staged.to_owned())
+    }
+}
 
 /// Unpack the release archive into `stage`, dropping its top folder (`FH1Rewrite-<ver>/`).
-#[cfg(windows)]
+#[cfg(not(target_os = "linux"))]
 fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut ar = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|e| format!("bad update zip: {e}"))?;
@@ -206,12 +251,18 @@ fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
         std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
         let mut out = std::fs::File::create(&dst).map_err(|e| e.to_string())?;
         std::io::copy(&mut e, &mut out).map_err(|e| format!("unpacking {rel_path}: {e}"))?;
+        // The executables' mode bits (macOS zips record them).
+        #[cfg(unix)]
+        if let Some(mode) = e.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode & 0o777)).map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
 
 /// Unpack the release archive into `stage` with the system `tar` (keeps the executable bits).
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
     let ok = Command::new("tar")
         .arg("-xzf")
@@ -246,7 +297,12 @@ fn old_name(p: &Path) -> PathBuf {
 
 /// Removes `*.old` files a previous update left behind (the old launcher / engine).
 pub fn cleanup(root: &Path) {
-    for dir in [root.to_path_buf(), root.join("bin"), root.join("licenses")] {
+    let dirs: &[&str] = if cfg!(target_os = "macos") {
+        &["Contents", "Contents/MacOS", "Contents/Resources", "Contents/Resources/licenses", "Contents/_CodeSignature"]
+    } else {
+        &["", "bin", "licenses"]
+    };
+    for dir in dirs.iter().map(|d| root.join(d)) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             if e.path().extension().is_some_and(|x| x == "old") {
                 let _ = std::fs::remove_file(e.path());
@@ -257,6 +313,10 @@ pub fn cleanup(root: &Path) {
 
 /// Start the (new) launcher and let this one close.
 pub fn restart(root: &Path) {
+    // macOS: a new instance of the bundle through LaunchServices (plain `open` would just bring this one forward).
+    if cfg!(target_os = "macos") && root.extension().is_some_and(|e| e == "app") && Command::new("open").arg("-n").arg(root).spawn().is_ok() {
+        return;
+    }
     let exe = root.join(LAUNCHER);
     let target = if exe.is_file() { exe } else { std::env::current_exe().unwrap_or(exe) };
     let _ = Command::new(target).current_dir(root).spawn();
@@ -265,6 +325,21 @@ pub fn restart(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_paths() {
+        let dir = Path::new("/Applications/FH1 Rewrite.app/Contents/MacOS");
+        if cfg!(target_os = "macos") {
+            assert_eq!(install_root(dir), Path::new("/Applications/FH1 Rewrite.app"));
+            assert_eq!(installed_path("FH1 Rewrite.app/Contents/MacOS/fh1-engine").as_deref(), Some(ENGINE));
+            assert_eq!(installed_path("README.txt"), None);
+        } else {
+            assert_eq!(install_root(dir), dir);
+            assert_eq!(installed_path(ENGINE).as_deref(), Some(ENGINE));
+            assert_eq!(installed_path("data/launcher.json"), None);
+        }
+        assert_eq!(install_root(Path::new("/opt/fh1")), Path::new("/opt/fh1"));
+    }
 
     #[test]
     fn versions() {
@@ -276,29 +351,55 @@ mod tests {
     }
 
     /// Downloads the latest real release into a temp "install" with fake old files and checks the swap.
-    /// `cargo test --release -p fh1-launcher -- --ignored` (network, ~75 MB).
+    /// `cargo test --release -p fh1-launcher -- --ignored installs_latest_release` (network, ~75 MB).
     #[test]
     #[ignore]
     fn installs_latest_release() {
         std::env::set_var("FH1_UPDATE_FORCE", "1");
-        let rel = check("0.0.0").expect("latest release");
-        let root = std::env::temp_dir().join(format!("fh1-update-test-{}", std::process::id()));
+        installs(&check("0.0.0").expect("latest release"), "latest");
+    }
+
+    /// The same with a release archive built locally (the macOS workflow's smoke test):
+    /// `FH1_UPDATE_TEST_ARCHIVE=<archive> cargo test --release -p fh1-launcher -- --ignored installs_local_archive`.
+    #[test]
+    #[ignore]
+    fn installs_local_archive() {
+        let Some(archive) = std::env::var_os("FH1_UPDATE_TEST_ARCHIVE") else { return };
+        let archive = std::path::absolute(archive).unwrap();
+        let bytes = std::fs::read(&archive).unwrap();
+        let sha256 = Some(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect());
+        let path = archive.display().to_string().replace('\\', "/").replace(' ', "%20");
+        let url = format!("file://{}{path}", if path.starts_with('/') { "" } else { "/" });
+        installs(&Release { version: "0.0.0-local".into(), url, size: bytes.len() as u64, sha256, page: String::new() }, "local");
+    }
+
+    /// Installs `rel` over a temp "install" holding fake old files and checks the swap and the clean-up.
+    fn installs(rel: &Release, tag: &str) {
+        let root = std::env::temp_dir().join(format!("fh1-update-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join(ENGINE).parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join(LAUNCHER).parent().unwrap()).unwrap();
         std::fs::write(root.join(LAUNCHER), b"old launcher").unwrap();
-        std::fs::write(root.join("bin/fh1-engine.exe"), b"old engine").unwrap();
+        std::fs::write(root.join(ENGINE), b"old engine").unwrap();
         std::fs::write(root.join("data/keep.txt"), b"user data").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        install(&rel, &root, &root.join("data"), &tx, &|| {});
+        install(rel, &root, &root.join("data"), &tx, &|| {});
         let msgs: Vec<_> = rx.try_iter().collect();
         assert!(matches!(msgs.last(), Some(UpdateMsg::Installed)), "{:?}", msgs.iter().filter_map(|m| if let UpdateMsg::Failed(e) = m { Some(e.clone()) } else { None }).collect::<Vec<_>>());
-        assert!(std::fs::metadata(root.join("bin/fh1-engine.exe")).unwrap().len() > 1_000_000);
+        assert!(std::fs::metadata(root.join(ENGINE)).unwrap().len() > 1_000_000);
         assert!(std::fs::metadata(root.join(LAUNCHER)).unwrap().len() > 1_000_000);
-        assert!(root.join("bin/fh1-engine.exe.old").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [ENGINE, LAUNCHER] {
+                assert!(std::fs::metadata(root.join(f)).unwrap().permissions().mode() & 0o111 != 0, "{f} is not executable");
+            }
+        }
+        assert!(old_name(&root.join(ENGINE)).is_file());
         assert_eq!(std::fs::read(root.join("data/keep.txt")).unwrap(), b"user data");
         cleanup(&root);
-        assert!(!root.join("bin/fh1-engine.exe.old").exists());
+        assert!(!old_name(&root.join(ENGINE)).exists() && !old_name(&root.join(LAUNCHER)).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
