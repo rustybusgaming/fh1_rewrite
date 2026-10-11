@@ -16,7 +16,10 @@
 //!   an offscreen image of scale x window, and a Camera2d (order 1, layer [`BLIT_LAYER`]) draws it over the window with
 //!   linear filtering and Bevy's contrast-adaptive sharpening (`FH1_CAS=0` off, `FH1_CAS_STRENGTH`, default 0.5). The
 //!   blit camera copies the main camera's Hdr / usages, so the HUD (which copies them too) shares its texture.
-//!   `FH1_RENDER_SCALE=0.5..1` overrides the setting.
+//!   `FH1_RENDER_SCALE=0.5..1` overrides the setting. Caps on top, both upscaled the same way: the Console preset renders
+//!   at most 720 lines; on a Mac with a HiDPI (Retina) window the main camera renders at most FH1_HIDPI_LINES lines
+//!   (default 1080, about the pixels of the 1080p screens the presets are tuned on; 0 = native), since a MacBook's panel
+//!   has 2-3x those pixels and a 5K display 7x. Options shows what runs.
 //! - **Quality** Low / Medium / High (default) / Ultra fills [`fh1_render::quality::GraphicsQuality`], which the owners
 //!   of shadows, the car probe, draw distance, particles and crowds read.
 //! - **Occlusion culling** (opt-in `FH1_OCCLUSION=1`): Bevy's experimental two-phase GPU occlusion culling
@@ -246,12 +249,26 @@ pub fn blur_value(g: &GraphicsSettings) -> String {
 
 pub fn scale_value(g: &GraphicsSettings) -> String {
     let set = format!("{:.0}%", g.render_scale * 100.0);
-    let run = render_scale(g);
+    // What sync_render_scale applies (the caps included), else the setting / override.
+    let run = f32::from_bits(RUN_SCALE.load(std::sync::atomic::Ordering::Relaxed));
+    let run = if run > 0.0 { run } else { render_scale(g) };
     if (run - g.render_scale).abs() < 1e-3 { set } else { format!("{set} (runs {:.0}%)", run * 100.0) }
 }
 
+/// The render scale sync_render_scale applied last (f32 bits; 0 = not yet).
+static RUN_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// P17-A: the Console preset's internal resolution cap (lines).
 const CONSOLE_LINES: f32 = 720.0;
+
+/// macOS: the internal resolution cap (lines) for a HiDPI window (FH1_HIDPI_LINES, default 1080; 0 = none).
+fn hidpi_lines() -> Option<f32> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let lines = std::env::var("FH1_HIDPI_LINES").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1080.0);
+    (lines.is_finite() && lines > 0.0).then_some(lines)
+}
 
 /// Picking Console in Options also picks the AA and blur that suit an integrated GPU (both stay changeable after):
 /// FXAA (MSAA costs bandwidth without the 360's eDRAM), no motion blur.
@@ -425,6 +442,11 @@ fn sync_render_scale(
     if settings.graphics.quality == Quality::Console && phys.y > 0 {
         scale = scale.min(CONSOLE_LINES / phys.y as f32).max(0.25);
     }
+    // Mac HiDPI window: at most FH1_HIDPI_LINES (a 14" MacBook Pro's 1964 lines render at 55 %).
+    if let Some(lines) = hidpi_lines().filter(|_| window.scale_factor() > 1.0 && phys.y > 0) {
+        scale = scale.min(lines / phys.y as f32).max(0.25);
+    }
+    RUN_SCALE.store(scale.min(1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
     if scale >= 0.999 {
         if state.0.take().is_some() {
             *target = RenderTarget::Window(WindowRef::Primary);

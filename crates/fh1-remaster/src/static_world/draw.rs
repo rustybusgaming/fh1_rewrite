@@ -14,6 +14,8 @@
 //! Compaction (chunk 5, default when the GPU has MULTI_DRAW_INDIRECT_COUNT; `FH1_STATIC_WORLD_COMPACT=0` = off): visible
 //! candidates are appended per (view, bin) with an atomic counter and each bin is drawn with
 //! `multi_draw_indexed_indirect_count`, so culled entries cost nothing (no zero-instance draws for the command processor).
+//! Without indirect-count draws (Metal) the compacted bins are drawn with counts estimated from read-backs (estimate.rs;
+//! `FH1_SW_DRAW_ESTIMATE=0` = every candidate, as before).
 //! Chunk 4: the same cull feeds (a) the car probe faces (fh1-remaster car_probe.rs `CarProbeFace`, 47's rules: radius >=
 //! `probe_min_radius()`, within the face's far plane) and (b) a depth-only pass into each directional shadow cascade of the
 //! main camera after Bevy's shadow pass (records with the casts flag; small casters (half-diagonal < 1.5 m) only within
@@ -57,6 +59,8 @@ use bevy::render::{Render, RenderSystems};
 use bevy::shader::ShaderDefVal;
 
 use super::{Arena, FLAG_HIDDEN, FLAG_LIVE, FLAG_MASK, FLAG_MIRRORED, FLAG_TWO_SIDED};
+
+mod estimate;
 use crate::car_probe::CarProbeFace;
 use crate::material::RemasterMaterial;
 
@@ -67,6 +71,10 @@ pub(super) const SHADOW_SHADER: Handle<Shader> = bevy::asset::uuid_handle!("3e8b
 /// Render-world counters for the perf CSV (static_world::render_stats): candidates, views culled this frame.
 pub(super) static CANDIDATES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub(super) static VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Indirect draw entries the static world handed the GPU last frame (per bin: the capacity, or the estimate).
+pub(super) static DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// This frame's so far (published to DRAWS by the next `prepare_views`).
+static DRAWS_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Views drawn per frame at most (main, probe face, cascades); each owns an args region.
 const MAX_VIEWS: u32 = 12;
@@ -88,6 +96,11 @@ fn shadows_on() -> bool {
 fn compact_wanted() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| flag_on("FH1_STATIC_WORLD_COMPACT"))
+}
+
+/// The cull compacts each bin's visible candidates: drawn with indirect counts, or with estimated counts without them.
+fn compaction(device: &RenderDevice) -> bool {
+    compact_wanted() && (device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT) || estimate::wanted())
 }
 
 fn probe_on() -> bool {
@@ -188,7 +201,10 @@ pub(super) fn plugin(ra: &mut SubApp) {
         .init_resource::<SpecializedRenderPipelines<ShadowPipeline>>()
         .init_resource::<DrawLists>()
         .init_resource::<ViewUniforms>()
-        .add_systems(Render, (resolve_materials, build_lists).chain().in_set(RenderSystems::PrepareResources).after(super::apply_ops))
+        .init_resource::<estimate::Estimates>()
+        .add_systems(Render, (resolve_materials, build_lists, estimate::collect_readbacks).chain().in_set(RenderSystems::PrepareResources).after(super::apply_ops))
+        // After the frame's submit: this frame's draw counts back to the CPU (estimated draws only).
+        .add_systems(Render, estimate::read_back_counts.in_set(RenderSystems::Cleanup))
         .add_systems(Render, (init_pipelines, specialize_views).chain().in_set(RenderSystems::Queue))
         .add_systems(Render, (prepare_views, prepare_bind_groups).chain().in_set(RenderSystems::PrepareBindGroups))
         // After Bevy's prepass too: with FH1_SW_ENC_MERGE it also records the main view's pre-pass.
@@ -373,8 +389,10 @@ impl SpecializedRenderPipeline for ShadowPipeline {
 pub(super) struct CullPipeline {
     layout: BindGroupLayoutDescriptor,
     id: CachedComputePipelineId,
-    /// Compacted args + indirect count draws.
+    /// Compacted args (each bin's visible candidates first), drawn with indirect counts or estimated counts.
     compact: bool,
+    /// Compacted without indirect-count draws: estimated counts (estimate.rs).
+    estimated: bool,
 }
 
 fn init_pipelines(
@@ -432,7 +450,8 @@ fn init_pipelines(
         ),
     );
     commands.insert_resource(super::hiz::HizPipelines::new(&cache));
-    let compact = compact_wanted() && device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT);
+    let compact = compaction(&device);
+    let estimated = compact && (!device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT) || estimate::forced());
     let id = cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("static world cull".into()),
         layout: vec![cull_layout.clone()],
@@ -442,9 +461,9 @@ fn init_pipelines(
         ..default()
     });
     let unclipped = device.features().contains(WgpuFeatures::DEPTH_CLIP_CONTROL);
-    info!("static world: pipelines ready (bindless materials: {bindless}, unclipped shadow depth: {unclipped}, compacted draws: {compact})");
+    info!("static world: pipelines ready (bindless materials: {bindless}, unclipped shadow depth: {unclipped}, compacted draws: {compact}, estimated counts: {estimated})");
     commands.insert_resource(ShadowPipeline { view_layout, arena_layout: arena_layout.clone(), material_layout: material_layout.clone(), bindless, unclipped });
-    commands.insert_resource(CullPipeline { layout: cull_layout, id, compact });
+    commands.insert_resource(CullPipeline { layout: cull_layout, id, compact, estimated });
     commands.insert_resource(SwPipeline { mesh_pipeline: mp.clone(), layout_ref, arena_layout, material_layout, bindless });
 }
 
@@ -674,7 +693,7 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
     // P15-A draw bins in draw order, each with its own arg range (capacity = the source bin's count): near cutouts,
     // pre-passed occluders, near opaque, far opaque, far cutouts. `class_bins[i]` = draw bin of source bin i per class.
     let n_mask = src.iter().filter(|b| b.variant.mask).count();
-    let mut split = cull && order_on() && compact_wanted() && device.features().contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT);
+    let mut split = cull && order_on() && compaction(&device);
     if split && n_mask * 2 + (src.len() - n_mask) * 3 > MAX_DRAW_BINS {
         warn!("static world: {} source bins, too many for the draw classes; class split off", src.len());
         split = false;
@@ -763,7 +782,8 @@ fn build_lists(mut arena: ResMut<Arena>, mut lists: ResMut<DrawLists>, device: R
         lists.counts = Some(device.create_buffer(&BufferDescriptor {
             label: Some("static world draw counts"),
             size: cap as u64 * MAX_VIEWS as u64 * 4,
-            usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            // COPY_SRC: read back for the estimated counts (estimate.rs).
+            usage: BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         }));
         lists.bins_cap = cap;
@@ -820,6 +840,8 @@ pub(super) struct SwCullView {
     base: u32,
     /// First draw count of this view (compaction).
     counts: u32,
+    /// The view's slot this frame (args region / draw counts index).
+    slot: u32,
 }
 
 #[derive(Resource, Default)]
@@ -877,6 +899,7 @@ fn prepare_views(
     stale: Query<Entity, Or<(With<SwCullView>, With<SwCullViewHiz>, With<SwPrepass>)>>,
     depths: Query<&ViewDepthTexture>,
     (mut hiz, hiz_pipes, cache, shadow): (ResMut<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<PipelineCache>, Option<Res<ShadowPipeline>>),
+    (mut est, cull): (ResMut<estimate::Estimates>, Option<Res<CullPipeline>>),
 ) {
     // Views not drawn this frame (a cached cascade, an idle probe face) must not keep last frame's slot.
     for e in &stale {
@@ -897,20 +920,30 @@ fn prepare_views(
     u.buffer.clear();
     CANDIDATES.store(lists.count, std::sync::atomic::Ordering::Relaxed);
     VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
+    DRAWS.store(DRAWS_FRAME.swap(0, std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    // Estimated draw counts (no indirect count): this frame's views get their estimates as they get a slot.
+    let estimated = cull.as_ref().is_some_and(|c| c.estimated);
+    if estimated {
+        let main = cameras.iter().find(|c| is_main(c.2)).map(|c| (c.1.world_from_view.translation(), Vec3::from(c.1.world_from_view.forward())));
+        est.begin_frame(&lists, main);
+    }
     if !cull_on() || lists.count == 0 {
         return;
     }
     let (count, region, bins_cap) = (lists.count, lists.region, lists.bins_cap);
     let mut slot = 0u32;
-    let mut push = |vu: ViewUniform, buffer: &mut DynamicUniformBuffer<ViewUniform>| -> Option<SwCullView> {
+    let mut push = |vu: ViewUniform, key: estimate::ViewKey, buffer: &mut DynamicUniformBuffer<ViewUniform>| -> Option<SwCullView> {
         if slot >= MAX_VIEWS {
             return None;
         }
         let base = slot * region;
         let counts = slot * bins_cap;
         let offset = buffer.push(&ViewUniform { info: UVec4::new(vu.info.x, base, count, counts), ..vu });
+        if estimated {
+            est.add_view(slot, key, &lists);
+        }
         slot += 1;
-        Some(SwCullView { offset, base, counts })
+        Some(SwCullView { offset, base, counts, slot: slot - 1 })
     };
     let skip_mask = skip.map_or(0, |s| s.0);
     for (e, view, camera, face, view_lights, jittered) in &cameras {
@@ -966,7 +999,7 @@ fn prepare_views(
                 opts,
             }
         };
-        if let Some(cv) = push(vu, &mut u.buffer) {
+        if let Some(cv) = push(vu, (view.retained_view_entity, 0), &mut u.buffer) {
             commands.entity(e).insert(cv);
             // Not under TAA / DLSS jitter: the cull matrix is unjittered, the pre-pass edges would not match the lit pass.
             if main && vu.ring.x > 0.0 && !jittered {
@@ -974,7 +1007,7 @@ fn prepare_views(
             }
         }
         if hiz_now {
-            if let Some(cv) = push(ViewUniform { extra: UVec4::new(2, mips, 0, 0), ..vu }, &mut u.buffer) {
+            if let Some(cv) = push(ViewUniform { extra: UVec4::new(2, mips, 0, 0), ..vu }, (view.retained_view_entity, 2), &mut u.buffer) {
                 commands.entity(e).insert(SwCullViewHiz(cv));
             }
         }
@@ -998,7 +1031,7 @@ fn prepare_views(
                     ring: Vec4::ZERO,
                     opts,
                 };
-                if let Some(cv) = push(vu, &mut u.buffer) {
+                if let Some(cv) = push(vu, (lv.retained_view_entity, 0), &mut u.buffer) {
                     commands.entity(le).insert(cv);
                 }
             }
@@ -1085,11 +1118,19 @@ fn dispatch_cull(ctx: &mut RenderContext, cache: &PipelineCache, cull: &CullPipe
 }
 
 /// Clears the draw counts of `views` (compaction), before the pass that culls them. False = the cull can't run.
+/// Estimated counts also clear the views' args regions: the entries past a bin's GPU count are then empty draws.
 fn clear_counts(ctx: &mut RenderContext, cull: &CullPipeline, lists: &DrawLists, views: &[SwCullView]) -> bool {
     if cull.compact {
         let Some(counts) = lists.counts.as_ref() else { return false };
         for v in views {
             ctx.command_encoder().clear_buffer(counts, v.counts as u64 * 4, Some(lists.bins_cap as u64 * 4));
+        }
+    }
+    if cull.estimated {
+        let Some(args) = lists.args.as_ref() else { return false };
+        for v in views {
+            ctx.command_encoder().clear_buffer(args, v.base as u64 * ARGS_BYTES, Some(lists.region as u64 * ARGS_BYTES));
+            estimate::CULLED.fetch_or(1 << v.slot, std::sync::atomic::Ordering::Relaxed);
         }
     }
     true
@@ -1141,6 +1182,7 @@ fn draw_static_world(
     cache: Res<PipelineCache>,
     allocators: Res<MaterialBindGroupAllocators>,
     (hiz, hiz_pipes, device): (Res<super::hiz::Hiz>, Option<Res<super::hiz::HizPipelines>>, Res<RenderDevice>),
+    est: Res<estimate::Estimates>,
     mut ctx: RenderContext,
 ) {
     let (camera, target, depth, view_bg, pipelines, cull_view, hiz_view, prepassed) = view.into_inner();
@@ -1149,16 +1191,14 @@ fn draw_static_world(
         return;
     }
     let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { return };
-    let compact = cull.as_ref().is_some_and(|c| c.compact) && cull_on();
     // The main view uses every draw class (P15-A order); other views cull everything into CLASS_FAR.
     let classes = lists.split && is_main(camera);
     // GPU / CPU time of the passes for the perf recorder (RenderDiagnosticsPlugin; a no-op without it).
     let recorder = ctx.diagnostic_recorder();
     let diagnostics = recorder.as_deref();
-    // One lit pass over every bin from `base` (+ draw counts when compacted). `span`: the recorder's pass name (P18: the
-    // Hi-Z phase-2 pass is "static_world_phase2", so the GPU table splits the lit cost between the two passes).
-    let draw = |ctx: &mut RenderContext, base: u32, counts: Option<u32>, span: &'static str| {
-        let counts = counts.and_then(|c| lists.counts.as_ref().map(|b| (b, c)));
+    // One lit pass over every bin from `base` (`draws`: how many entries per bin). `span`: the recorder's pass name (P18:
+    // the Hi-Z phase-2 pass is "static_world_phase2", so the GPU table splits the lit cost between the two passes).
+    let draw = |ctx: &mut RenderContext, base: u32, draws: Draws<'_>, span: &'static str| {
         let color = [Some(target.get_color_attachment())];
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("static_world"),
@@ -1186,14 +1226,14 @@ fn draw_static_world(
             let Some(material_bg) = slab.bind_group() else { continue };
             pass.set_render_pipeline(p);
             pass.set_bind_group(3, material_bg, &[]);
-            draw_bin(&mut pass, args, counts, base, b as u32, bin);
+            draw_bin(&mut pass, args, draws, base, b as u32, bin);
         }
         span.end(&mut pass);
     };
     // Unculled (FH1_STATIC_WORLD_CULL=0): region 0, main camera only.
     if !cull_on() {
         if is_main(camera) {
-            draw(&mut ctx, 0, None, "static_world");
+            draw(&mut ctx, 0, Draws::All, "static_world");
         }
         return;
     }
@@ -1208,7 +1248,7 @@ fn draw_static_world(
     } else if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
         return;
     }
-    draw(&mut ctx, cv.base, compact.then_some(cv.counts), "static_world");
+    draw(&mut ctx, cv.base, Draws::of(cull, &lists, &est, cv), "static_world");
     // Hi-Z phase 2 (main view): pyramid from the depth so far, occlusion-tested cull, the newly visible.
     if let (Some(SwCullViewHiz(cv2)), Some(pipes)) = (hiz_view, hiz_pipes.as_ref()) {
         if hiz.active {
@@ -1222,11 +1262,11 @@ fn draw_static_world(
                 }
             }
             if merged {
-                draw(&mut ctx, cv2.base, compact.then_some(cv2.counts), "static_world_phase2");
+                draw(&mut ctx, cv2.base, Draws::of(cull, &lists, &est, cv2), "static_world_phase2");
             } else {
                 hiz.build(&mut ctx, &cache, pipes, &device, depth.view());
                 if dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv2, lists.count) {
-                    draw(&mut ctx, cv2.base, compact.then_some(cv2.counts), "static_world_phase2");
+                    draw(&mut ctx, cv2.base, Draws::of(cull, &lists, &est, cv2), "static_world_phase2");
                 }
             }
         }
@@ -1246,6 +1286,7 @@ fn draw_static_prepass(
     cull: Option<Res<CullPipeline>>,
     cache: Res<PipelineCache>,
     allocators: Res<MaterialBindGroupAllocators>,
+    est: Res<estimate::Estimates>,
     mut ctx: RenderContext,
 ) {
     if enc_merge_on() {
@@ -1257,7 +1298,7 @@ fn draw_static_prepass(
     if !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
         return;
     }
-    record_prepass(&mut ctx, camera, depth, pipelines, cv, &arena, &lists, &uniforms, cull, &cache, &allocators);
+    record_prepass(&mut ctx, camera, depth, pipelines, cv, &arena, &lists, &uniforms, cull, &cache, &allocators, &est);
 }
 
 /// The pre-pass's depth-only draws (its cull already dispatched).
@@ -1274,8 +1315,9 @@ fn record_prepass(
     cull: &CullPipeline,
     cache: &PipelineCache,
     allocators: &MaterialBindGroupAllocators,
+    est: &estimate::Estimates,
 ) {
-    let (Some(pipelines), Some((_, arena_bg)), Some(args), Some(ib), Some(view_bg), Some(counts)) =
+    let (Some(pipelines), Some((_, arena_bg)), Some(args), Some(ib), Some(view_bg), Some(_)) =
         (pipelines, lists.arena_bind_group.as_ref(), lists.args.as_ref(), arena.index_buffer(), uniforms.shadow_view_bind_group.as_ref(), lists.counts.as_ref())
     else {
         return;
@@ -1301,6 +1343,7 @@ fn record_prepass(
     pass.set_bind_group(1, arena_bg, &[]);
     pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
     let span = diagnostics.pass_span(&mut pass, "static_world_prepass");
+    let draws = Draws::of(cull, lists, est, cv);
     for (b, bin) in lists.bins.iter().enumerate() {
         if bin.class != CLASS_OCC {
             continue;
@@ -1314,19 +1357,54 @@ fn record_prepass(
             pass.set_bind_group(2, material_bg, &[]);
         }
         pass.set_render_pipeline(p);
-        draw_bin(&mut pass, args, Some((counts, cv.counts)), cv.base, b as u32, bin);
+        draw_bin(&mut pass, args, draws, cv.base, b as u32, bin);
     }
     span.end(&mut pass);
 }
 
-/// One bin's draws (`b` = its index in `lists.bins`): compacted (indirect count) or every candidate (zero-instance when
-/// culled).
-fn draw_bin<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, args: &'a Buffer, counts: Option<(&'a Buffer, u32)>, base: u32, b: u32, bin: &Bin) {
-    let offset = (base + bin.first) as u64 * ARGS_BYTES;
-    match counts {
-        Some((cb, cbase)) => pass.multi_draw_indexed_indirect_count(args, offset, cb, (cbase + b) as u64 * 4, bin.count),
-        None => pass.multi_draw_indexed_indirect(args, offset, bin.count),
+/// How a view's bins are drawn.
+#[derive(Clone, Copy)]
+enum Draws<'a> {
+    /// Every entry of the bin (zero-instance when culled).
+    All,
+    /// Compacted, with the GPU's draw counts (this view's first count).
+    Indirect(&'a Buffer, u32),
+    /// Compacted, with estimated counts per bin (estimate.rs).
+    Estimated(&'a [u32]),
+}
+
+impl<'a> Draws<'a> {
+    /// The draws of the culled view `cv`.
+    fn of(cull: &CullPipeline, lists: &'a DrawLists, est: &'a estimate::Estimates, cv: &SwCullView) -> Self {
+        match (cull.compact, cull.estimated, lists.counts.as_ref()) {
+            (true, false, Some(c)) => Draws::Indirect(c, cv.counts),
+            (true, true, _) => est.slot(cv.slot).map_or(Draws::All, Draws::Estimated),
+            _ => Draws::All,
+        }
     }
+}
+
+/// One bin's draws (`b` = its index in `lists.bins`).
+fn draw_bin<'a>(pass: &mut bevy::render::render_phase::TrackedRenderPass<'a>, args: &'a Buffer, draws: Draws<'a>, base: u32, b: u32, bin: &Bin) {
+    let offset = (base + bin.first) as u64 * ARGS_BYTES;
+    let n = match draws {
+        Draws::Indirect(cb, cbase) => {
+            pass.multi_draw_indexed_indirect_count(args, offset, cb, (cbase + b) as u64 * 4, bin.count);
+            bin.count
+        }
+        Draws::Estimated(est) => {
+            let n = est.get(b as usize).map_or(bin.count, |&n| n.min(bin.count));
+            if n > 0 {
+                pass.multi_draw_indexed_indirect(args, offset, n);
+            }
+            n
+        }
+        Draws::All => {
+            pass.multi_draw_indexed_indirect(args, offset, bin.count);
+            bin.count
+        }
+    };
+    DRAWS_FRAME.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Static scenery into the main camera's directional cascades (after Bevy's shadow pass, same depth attachments).
@@ -1347,6 +1425,7 @@ fn draw_static_shadows(
     shadow: Option<Res<ShadowPipeline>>,
     cache: Res<PipelineCache>,
     allocators: Res<MaterialBindGroupAllocators>,
+    est: Res<estimate::Estimates>,
     mut ctx: RenderContext,
 ) {
     if !cull_on() || lists.bins.is_empty() {
@@ -1389,7 +1468,6 @@ fn draw_static_shadows(
         };
         let Some(allocator) = allocators.get(&TypeId::of::<RemasterMaterial>()) else { break 'cascades };
         let Some(shadow) = shadow.as_ref() else { break 'cascades };
-        let counts = if cull.compact { lists.counts.as_ref() } else { None };
         let recorder = ctx.diagnostic_recorder();
         let diagnostics = recorder.as_deref();
         for (shadow_view, cv) in &cascades {
@@ -1408,6 +1486,7 @@ fn draw_static_shadows(
             pass.set_bind_group(1, arena_bg, &[]);
             pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
             let span = diagnostics.pass_span(&mut pass, "static_world_shadow");
+            let draws = Draws::of(cull, &lists, &est, cv);
             for &b in &lists.shadow_order {
                 let bin = &lists.bins[b as usize];
                 // Cascades: far = all casters, near = the in-band (dithered) ones (P15-A fade mode 1); no occluder class.
@@ -1425,7 +1504,7 @@ fn draw_static_shadows(
                     pass.set_bind_group(2, material_bg, &[]);
                 }
                 pass.set_render_pipeline(p);
-                draw_bin(&mut pass, args, counts.map(|c| (c, cv.counts)), cv.base, b, bin);
+                draw_bin(&mut pass, args, draws, cv.base, b, bin);
             }
             span.end(&mut pass);
         }
@@ -1435,7 +1514,7 @@ fn draw_static_shadows(
         if !batched && !dispatch_cull(&mut ctx, &cache, cull, &uniforms, &lists, cv, lists.count) {
             return;
         }
-        record_prepass(&mut ctx, camera, depth, pipelines, cv, &arena, &lists, &uniforms, cull, &cache, &allocators);
+        record_prepass(&mut ctx, camera, depth, pipelines, cv, &arena, &lists, &uniforms, cull, &cache, &allocators, &est);
     }
 }
 
