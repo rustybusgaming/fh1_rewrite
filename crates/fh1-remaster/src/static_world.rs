@@ -191,10 +191,11 @@ fn push(op: Op) {
     });
 }
 
-/// Render-world counters (perf CSV): draw candidates and views culled in the last frame.
-pub fn render_stats() -> (u32, u32) {
+/// Render-world counters (perf CSV): draw candidates, views culled, and indirect draw entries handed to the GPU (the
+/// bins' capacities, or their estimates on Metal: draw/estimate.rs) in the last frame.
+pub fn render_stats() -> (u32, u32, u32) {
     use std::sync::atomic::Ordering::Relaxed;
-    (draw::CANDIDATES.load(Relaxed), draw::VIEWS.load(Relaxed))
+    (draw::CANDIDATES.load(Relaxed), draw::VIEWS.load(Relaxed), draw::DRAWS.load(Relaxed))
 }
 
 /// Main-world counters (perf CSV / logs).
