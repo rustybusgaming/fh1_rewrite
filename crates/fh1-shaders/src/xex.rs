@@ -10,27 +10,44 @@
 //! u16 0}` (the first block's size is in the format info); each chunk is one LZX frame.
 //!
 //! The Xbox 360 retail XEX key is not part of this repository. Encrypted images need it from the user:
-//! `FH1_XEX_KEY=<32 hex digits>` or a file `data/xex_key.txt` holding the same (see README.md).
+//! `FH1_XEX_KEY=<32 hex digits>` or a file `xex_key.txt` in the data folder holding the same (see README.md).
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::Error;
 
-/// Where [`retail_key`] looks for the key file when `FH1_XEX_KEY` is not set.
+/// Where [`retail_key`] looks for the key file when `FH1_XEX_KEY` is not set (after [`set_key_file`]'s).
 pub const KEY_FILE: &str = "data/xex_key.txt";
 
-/// The retail XEX key from `FH1_XEX_KEY`, [`KEY_FILE`] or, last, the key a release build embedded at compile time
-/// (`FH1_XEX_KEY_EMBED` set while building, by tools/release.ps1; never in the source) (32 hex digits; spaces, commas
-/// and `0x` are ignored).
+static DATA_KEY_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// The key file to look at first: fh1setup passes `<data>/xex_key.txt`, so the key is found in the data folder
+/// whatever the working directory (the macOS launcher runs setup in the data folder, not next to it).
+pub fn set_key_file(path: PathBuf) {
+    let _ = DATA_KEY_FILE.set(path);
+}
+
+/// The retail XEX key from `FH1_XEX_KEY`, the [`set_key_file`] file, [`KEY_FILE`] or, last, the key a release build
+/// embedded at compile time (`FH1_XEX_KEY_EMBED` set while building, by tools/release.ps1 and the Linux / macOS
+/// workflows; never in the source) (32 hex digits; spaces, commas and `0x` are ignored). Empty values count as unset:
+/// a workflow run without the `FH1_XEX_KEY` secret embeds an empty key.
 pub fn retail_key() -> Result<[u8; 16], Error> {
-    let text = match std::env::var("FH1_XEX_KEY") {
-        Ok(v) => v,
-        Err(_) => match std::fs::read_to_string(KEY_FILE) {
-            Ok(v) => v,
-            Err(_) => option_env!("FH1_XEX_KEY_EMBED").map(str::to_owned).ok_or_else(|| {
-                Error::Unsupported(format!("default.xex is encrypted: put the Xbox 360 retail XEX key (32 hex digits) in {KEY_FILE} or FH1_XEX_KEY"))
-            })?,
-        },
+    let given = |v: String| (!v.trim().is_empty()).then_some(v);
+    let files: Vec<PathBuf> = DATA_KEY_FILE.get().cloned().into_iter().chain([PathBuf::from(KEY_FILE)]).collect();
+    let (text, source) = if let Some(v) = std::env::var("FH1_XEX_KEY").ok().and_then(given) {
+        (v, "FH1_XEX_KEY".to_owned())
+    } else if let Some((v, f)) = files.iter().find_map(|f| std::fs::read_to_string(f).ok().and_then(given).map(|v| (v, f))) {
+        (v, f.display().to_string())
+    } else if let Some(v) = option_env!("FH1_XEX_KEY_EMBED").map(str::to_owned).and_then(given) {
+        (v, "the key built into this program".to_owned())
+    } else {
+        return Err(Error::Unsupported(format!(
+            "default.xex is encrypted and this build has no Xbox 360 retail XEX key: put it (32 hex digits) in {} or FH1_XEX_KEY",
+            files[0].display()
+        )));
     };
-    parse_key(&text).ok_or_else(|| Error::Unsupported("xex key: expected 32 hex digits".into()))
+    parse_key(&text).ok_or_else(|| Error::Unsupported(format!("xex key from {source}: expected 32 hex digits")))
 }
 
 fn parse_key(text: &str) -> Option<[u8; 16]> {

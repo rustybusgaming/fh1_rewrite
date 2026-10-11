@@ -121,7 +121,9 @@ cargo run --release -p fh1-engine
 ```
 
 The Xbox 360 retail XEX key is needed to read the shaders inside `default.xex`. Source builds look for it in
-`data/xex_key.txt` or `FH1_XEX_KEY`; it is not part of this repository. Optional importers:
+`xex_key.txt` in the data folder (`data/` by default) or `FH1_XEX_KEY`; it is not part of this repository. The release
+workflows build it in from the `FH1_XEX_KEY` repository secret; without the secret, put the key in `xex_key.txt` in
+the install's data folder (`~/Library/Application Support/FH1 Rewrite` on macOS). Optional importers:
 
 ```
 cargo run --release -p fh1setup --features fh2 -- import-fh2 "path/to/FH2.iso"

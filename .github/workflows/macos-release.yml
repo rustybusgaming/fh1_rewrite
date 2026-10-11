@@ -51,7 +51,11 @@ jobs:
         env:
           FH1_XEX_KEY_EMBED: ${{ secrets.FH1_XEX_KEY }}
         # No RTX on macOS (DLSS is Windows-only here): --no-default-features drops fh1-engine's `rtx`.
-        run: cargo build --release --locked --no-default-features -p fh1setup --features fh2,fm4 -p fh1-launcher -p fh1-engine
+        run: |
+          if [ -z "$FH1_XEX_KEY_EMBED" ]; then
+            echo "::warning title=No XEX key::The FH1_XEX_KEY secret is not set, so fh1setup has no key built in: installs from this build need the key in xex_key.txt in the data folder (or FH1_XEX_KEY)."
+          fi
+          cargo build --release --locked --no-default-features -p fh1setup --features fh2,fm4 -p fh1-launcher -p fh1-engine
 
       - name: "Tests (formats paths, launcher, FX sampler array)"
         run: |

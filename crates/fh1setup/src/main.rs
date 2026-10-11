@@ -120,6 +120,8 @@ fn main() -> Result<()> {
     }
     let args = parse_args()?;
     std::fs::create_dir_all(&args.data)?;
+    // The shaders group decrypts default.xex: a user-supplied key sits in the data folder.
+    fh1_shaders::xex::set_key_file(args.data.join("xex_key.txt"));
     let disc = extract::resolve_disc(&args.source, &args.data.join("work"))?;
     println!("disc: {}", disc.display());
     install::run(&disc, &args.data, args.force, args.only.as_deref())
